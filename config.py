@@ -2,6 +2,8 @@
 import os
 import json
 from pathlib import Path
+from dataclasses import dataclass
+from typing import List
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -156,12 +158,84 @@ class CozeVars:
         return variables
 
 
-class Config:
-    """系统配置"""
+@dataclass
+class AccountConfig:
+    """单个闲鱼账号的配置"""
+    alias: str                  # 账号别名，同时作为 account_id
+    coze_token: str             # 该账号使用的 Coze API Token
+    bot_id: str                 # 该账号使用的 Coze Bot ID
 
-    # Coze API 配置
-    COZE_API_TOKEN: str = os.getenv("COZE_API_TOKEN", "")
-    COZE_BOT_ID: str = os.getenv("COZE_BOT_ID", "")
+    @property
+    def account_id(self) -> str:
+        return self.alias
+
+    @property
+    def user_data_dir(self) -> str:
+        # 每个账号独立的浏览器数据目录
+        safe_alias = self.alias.replace("/", "_").replace("\\", "_")
+        return str(Path(__file__).parent / f"browser_data_{safe_alias}")
+
+    def validate(self) -> bool:
+        if not self.alias:
+            print("错误: 账号别名不能为空")
+            return False
+        if not self.coze_token:
+            print(f"错误: 账号 {self.alias} 未设置 coze_token")
+            return False
+        if not self.bot_id:
+            print(f"错误: 账号 {self.alias} 未设置 bot_id")
+            return False
+        return True
+
+
+_ACCOUNTS_PATH = Path(__file__).parent / "accounts.json"
+
+
+def load_accounts() -> List[AccountConfig]:
+    """从 accounts.json 加载账号列表"""
+    if not _ACCOUNTS_PATH.exists():
+        return []
+    try:
+        with open(_ACCOUNTS_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        accounts = []
+        for item in data.get("accounts", []):
+            accounts.append(AccountConfig(
+                alias=item.get("alias", ""),
+                coze_token=item.get("coze_token", ""),
+                bot_id=item.get("bot_id", ""),
+            ))
+        return accounts
+    except Exception as e:
+        print(f"加载 accounts.json 失败: {e}")
+        return []
+
+
+def save_accounts(accounts: List[AccountConfig]) -> bool:
+    """将账号列表保存到 accounts.json"""
+    try:
+        data = {
+            "accounts": [
+                {
+                    "alias": acc.alias,
+                    "coze_token": acc.coze_token,
+                    "bot_id": acc.bot_id,
+                }
+                for acc in accounts
+            ]
+        }
+        with open(_ACCOUNTS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"保存 accounts.json 失败: {e}")
+        return False
+
+
+class Config:
+    """系统全局配置（从 .env 读取，不含账号信息）"""
+
+    # Coze API 基础地址（全局共用）
     COZE_API_BASE: str = "https://api.coze.cn"  # 国内版使用 coze.cn，海外版使用 coze.com
 
     # 闲鱼配置
@@ -175,7 +249,7 @@ class Config:
 
     # Inactive 主动发消息配置
     INACTIVE_ENABLED: bool = os.getenv("INACTIVE_ENABLED", "true").lower() == "true"  # 是否启用主动发消息
-    INACTIVE_TIMEOUT_MINUTES: int = int(os.getenv("INACTIVE_TIMEOUT_MINUTES", "3"))  # 超时时间（分钟）
+    INACTIVE_TIMEOUT_MINUTES: int = int(float(os.getenv("INACTIVE_TIMEOUT_MINUTES", "3")))  # 超时时间（分钟）
     INACTIVE_MESSAGE: str = os.getenv("INACTIVE_MESSAGE", "[inactive]")  # 发送给Coze的触发消息
     INACTIVE_SKIP_RESPONSE: str = os.getenv("INACTIVE_SKIP_RESPONSE", "[inact_skip]")  # Coze跳过发送的回复
 
@@ -193,7 +267,6 @@ class Config:
 
     # 浏览器配置
     HEADLESS: bool = os.getenv("HEADLESS", "false").lower() == "true"
-    USER_DATA_DIR: str = str(Path(__file__).parent / "browser_data")  # 浏览器数据目录，用于保持登录状态
     BROWSER_WIDTH: int = int(os.getenv("BROWSER_WIDTH", "1280"))  # 浏览器窗口宽度
     BROWSER_HEIGHT: int = int(os.getenv("BROWSER_HEIGHT", "800"))  # 浏览器窗口高度
 
@@ -203,14 +276,3 @@ class Config:
     db_user: str = os.getenv("DB_USER", "root")
     db_password: str = os.getenv("DB_PASSWORD", "root")
     db_name: str = os.getenv("DB_NAME", "xianyu")
-
-    @classmethod
-    def validate(cls) -> bool:
-        """验证必要配置是否完整"""
-        if not cls.COZE_API_TOKEN:
-            print("错误: 请设置 COZE_API_TOKEN")
-            return False
-        if not cls.COZE_BOT_ID:
-            print("错误: 请设置 COZE_BOT_ID")
-            return False
-        return True

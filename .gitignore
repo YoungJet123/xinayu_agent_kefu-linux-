@@ -63,3 +63,7 @@ GUI原型图/
 # 不上传的文件夹
 场景案例/
 docs/
+# 账号配置（包含 token 等敏感信息）
+accounts.json
+browser_data_*/
+accounts.json

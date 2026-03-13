@@ -21,12 +21,13 @@ class Message:
 class XianyuBrowser:
     """闲鱼浏览器自动化类"""
 
-    def __init__(self):
+    def __init__(self, user_data_dir: str = None):
         self.playwright = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.is_logged_in = False
+        self._user_data_dir = user_data_dir or str(Path(__file__).parent / "browser_data")
 
     def _get_status_mapping_js(self) -> str:
         """获取订单状态映射的 JavaScript 对象字符串（仅映射值）"""
@@ -39,7 +40,7 @@ class XianyuBrowser:
 
         # 使用持久化上下文保持登录状态
         self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=Config.USER_DATA_DIR,
+            user_data_dir=self._user_data_dir,
             headless=Config.HEADLESS,
             viewport={"width": Config.BROWSER_WIDTH, "height": Config.BROWSER_HEIGHT},
             locale="zh-CN",

@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from dotenv import load_dotenv, set_key
 from loguru import logger
 from logger_setup import set_gui_conversation_callback, rebind_console_output
-from config import DEFAULT_STATUS_MAPPING, DEFAULT_COZE_VARS, Config
+from config import DEFAULT_STATUS_MAPPING, DEFAULT_COZE_VARS, Config, AccountConfig, load_accounts, save_accounts
 
 
 def _extract_status_mapping_values(value):
@@ -24,6 +24,213 @@ def _extract_status_mapping_values(value):
     if isinstance(value, dict):
         return value.get('mapped', ''), value.get('system_msg', '')
     return value, ''
+
+
+class AccountTab:
+    """单个账号的 Tab，封装独立的运行状态、日志、对话记录"""
+
+    def __init__(self, parent_notebook: ttk.Notebook, account: AccountConfig, gui: 'XianyuGUI'):
+        self.account = account
+        self.gui = gui
+        self.is_running = False
+        self.is_paused = False
+        self.handler = None
+        self.loop = None
+        self.thread = None
+
+        # 创建 Tab 容器
+        self.frame = ttk.Frame(parent_notebook)
+        parent_notebook.add(self.frame, text=account.alias)
+
+        self._build_ui()
+
+    def _build_ui(self):
+        """构建账号 Tab 内的 UI"""
+        # 顶部控制栏
+        control_frame = ttk.Frame(self.frame)
+        control_frame.pack(fill="x", padx=15, pady=10)
+
+        self.start_btn = ttk.Button(
+            control_frame, text="启动", command=self._toggle_running, width=10
+        )
+        self.start_btn.pack(side="left", padx=5)
+
+        # 暂停按钮
+        self.pause_btn = ttk.Button(
+            control_frame, text="暂停", command=self._toggle_pause, width=10, state="disabled"
+        )
+        self.pause_btn.pack(side="left", padx=5)
+
+        self.status_var = tk.StringVar(value="已停止")
+        tk.Label(
+            control_frame, textvariable=self.status_var,
+            font=("Microsoft YaHei", 10), fg="gray"
+        ).pack(side="left", padx=15)
+
+        # 账号信息标签
+        tk.Label(
+            control_frame,
+            text=f"Bot: {self.account.bot_id[:12]}..." if len(self.account.bot_id) > 12 else f"Bot: {self.account.bot_id}",
+            font=("Microsoft YaHei", 9), fg="#666666"
+        ).pack(side="right", padx=10)
+
+        # 日志区域（对话记录 + 系统日志）
+        log_frame = ttk.LabelFrame(self.frame, text="运行日志", padding=8)
+        log_frame.pack(fill="both", expand=True, padx=15, pady=5)
+
+        self.log_notebook = ttk.Notebook(log_frame)
+        self.log_notebook.pack(fill="both", expand=True)
+
+        # Tab: 对话记录
+        conv_tab = ttk.Frame(self.log_notebook)
+        self.log_notebook.add(conv_tab, text="对话记录")
+
+        conv_columns = ('time', 'type', 'username', 'content', 'order_status')
+        self.conv_tree = ttk.Treeview(conv_tab, columns=conv_columns, show='headings', height=12)
+        self.conv_tree.heading('time', text='时间')
+        self.conv_tree.heading('type', text='类型')
+        self.conv_tree.heading('username', text='用户名')
+        self.conv_tree.heading('content', text='内容')
+        self.conv_tree.heading('order_status', text='订单状态')
+
+        self.conv_tree.column('time', width=70, anchor='center')
+        self.conv_tree.column('type', width=50, anchor='center')
+        self.conv_tree.column('username', width=100, anchor='center')
+        self.conv_tree.column('content', width=450, anchor='w')
+        self.conv_tree.column('order_status', width=80, anchor='center')
+
+        conv_sb = ttk.Scrollbar(conv_tab, orient="vertical", command=self.conv_tree.yview)
+        self.conv_tree.configure(yscrollcommand=conv_sb.set)
+        self.conv_tree.pack(side="left", fill="both", expand=True)
+        conv_sb.pack(side="right", fill="y")
+
+        self.conv_tree.tag_configure('user', background='#e3f2fd')
+        self.conv_tree.tag_configure('ai', background='#f3e5f5')
+
+        # Tab: 系统日志
+        sys_tab = ttk.Frame(self.log_notebook)
+        self.log_notebook.add(sys_tab, text="系统日志")
+
+        self.log_text = scrolledtext.ScrolledText(
+            sys_tab, height=12, font=("Consolas", 9),
+            bg="#1e1e1e", fg="#d4d4d4", state="disabled"
+        )
+        self.log_text.pack(fill="both", expand=True)
+        self.log_text.tag_configure("INFO", foreground="#4ec9b0")
+        self.log_text.tag_configure("WARNING", foreground="#dcdcaa")
+        self.log_text.tag_configure("ERROR", foreground="#f14c4c")
+
+        # 日志控制
+        log_ctrl = ttk.Frame(log_frame)
+        log_ctrl.pack(fill="x", pady=3)
+        ttk.Button(log_ctrl, text="清空日志", command=self._clear_log).pack(side="right")
+
+    def _toggle_running(self):
+        if self.is_running:
+            self._stop()
+        else:
+            self._start()
+
+    def _start(self):
+        if not self.account.validate():
+            messagebox.showwarning("警告", f"账号 {self.account.alias} 配置不完整，请检查账号管理页")
+            return
+
+        self.is_running = True
+        self.is_paused = False
+        self.start_btn.config(text="停止")
+        self.pause_btn.config(state="normal")
+        self.status_var.set("运行中...")
+        self._log(f"[{self.account.alias}] 正在启动...")
+
+        self.thread = threading.Thread(target=self._run_handler, daemon=True)
+        self.thread.start()
+        self.gui._refresh_accounts_tree()
+        self.gui._sync_overview_state()
+
+    def _run_handler(self):
+        try:
+            if "DISPLAY" not in os.environ:
+                os.environ["DISPLAY"] = ":0"
+
+            from message_handler import MessageHandler
+
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+
+            self.handler = MessageHandler(account=self.account)
+            self.loop.run_until_complete(self.handler.start())
+
+        except Exception as e:
+            self._log(f"运行出错: {e}", level="ERROR")
+            self.frame.after(0, self._on_stopped)
+
+    def _stop(self):
+        self._log(f"[{self.account.alias}] 正在停止...")
+        if self.handler:
+            self.handler.running = False
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        self._on_stopped()
+
+    def _on_stopped(self):
+        self.is_running = False
+        self.is_paused = False
+        self.start_btn.config(text="启动")
+        self.pause_btn.config(state="disabled")
+        self.status_var.set("已停止")
+        self._log(f"[{self.account.alias}] 已停止")
+        self.gui._refresh_accounts_tree()
+        self.gui._sync_overview_state()
+
+    def _toggle_pause(self):
+        if not self.is_running:
+            return
+        if self.is_paused:
+            self.is_paused = False
+            if self.handler:
+                self.handler.is_paused = False
+            self.pause_btn.config(text="暂停")
+            self.status_var.set("运行中...")
+            self._log(f"[{self.account.alias}] 已恢复")
+        else:
+            self.is_paused = True
+            if self.handler:
+                self.handler.is_paused = True
+            self.pause_btn.config(text="继续")
+            self.status_var.set("已暂停")
+            self._log(f"[{self.account.alias}] 已暂停")
+
+    def _log(self, message: str, level: str = "INFO"):
+        """向系统日志写入一条消息（线程安全）"""
+        def _append():
+            self.log_text.config(state="normal")
+            self.log_text.insert("end", message + "\n", level)
+            self.log_text.see("end")
+            self.log_text.config(state="disabled")
+        self.frame.after(0, _append)
+
+    def add_conversation_record(self, msg_type: str, username: str, content: str,
+                                 order_status: str = "", timestamp: str = None):
+        """向对话记录表格添加一行（线程安全）"""
+        import datetime
+        ts = timestamp or datetime.datetime.now().strftime("%H:%M:%S")
+        tag = 'user' if msg_type == 'user' else 'ai'
+        display_type = "买家" if msg_type == 'user' else "AI"
+
+        def _insert():
+            self.conv_tree.insert(
+                '', 'end',
+                values=(ts, display_type, username, content[:120], order_status),
+                tags=(tag,)
+            )
+            self.conv_tree.see(self.conv_tree.get_children()[-1])
+        self.frame.after(0, _insert)
+
+    def _clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.config(state="disabled")
 
 
 class XianyuGUI:
@@ -42,7 +249,9 @@ class XianyuGUI:
         self.thread = None
         self.show_debug_logs = False
         self.log_handler_id = None
-        self.float_ball = None  # 悬浮球窗口
+
+        # 账号 Tab 管理
+        self.account_tabs = {}  # alias -> AccountTab
 
         # 控制台窗口状态
         self.console_visible = False
@@ -76,6 +285,9 @@ class XianyuGUI:
         # 注册对话记录回调
         self._register_conversation_callback()
 
+        # 加载账号并创建 Tab
+        self._load_account_tabs()
+
         # 默认显示概览页
         self._show_page("overview")
 
@@ -105,6 +317,7 @@ class XianyuGUI:
 
         # 导航按钮
         nav_items = [
+            ("accounts", "账号管理"),
             ("overview", "概览"),
             ("reply_settings", "回复设置"),
             ("memory", "跨窗口记忆"),
@@ -139,7 +352,11 @@ class XianyuGUI:
         self.content_frame = ttk.Frame(main_container)
         self.content_frame.pack(side="right", fill="both", expand=True)
 
+        # 账号 Notebook（多账号 Tab，放在内容区顶部）
+        self.accounts_notebook = ttk.Notebook(self.content_frame)
+
         # 创建各个页面
+        self._create_accounts_page()
         self._create_overview_page()
         self._create_reply_settings_page()
         self._create_memory_page()
@@ -150,9 +367,10 @@ class XianyuGUI:
 
     def _show_page(self, page_id):
         """切换显示页面"""
-        # 隐藏所有页面
+        # 隐藏所有页面和账号 Notebook
         for page in self.pages.values():
             page.pack_forget()
+        self.accounts_notebook.pack_forget()
 
         # 更新导航按钮样式
         for pid, btn in self.nav_buttons.items():
@@ -163,7 +381,9 @@ class XianyuGUI:
 
         # 显示目标页面
         self.current_page = page_id
-        if page_id in self.pages:
+        if page_id == "accounts":
+            self.accounts_notebook.pack(fill="both", expand=True)
+        elif page_id in self.pages:
             self.pages[page_id].pack(fill="both", expand=True)
 
             # 如果是Coze会话页，自动刷新列表
@@ -173,6 +393,162 @@ class XianyuGUI:
             # 如果是同步商品页，自动刷新列表
             if page_id == "sync_products" and hasattr(self, '_refresh_products_list'):
                 self._refresh_products_list()
+
+    # ==================== 账号管理页 ====================
+    def _create_accounts_page(self):
+        """创建账号管理页（作为 accounts_notebook 的第一个 Tab）"""
+        mgmt_frame = ttk.Frame(self.accounts_notebook)
+        self.accounts_notebook.add(mgmt_frame, text="＋ 账号管理")
+
+        # 说明
+        ttk.Label(
+            mgmt_frame,
+            text="在此添加/删除闲鱼账号，每个账号独立运行，最多支持10个。",
+            font=("Microsoft YaHei", 9), foreground="#666666"
+        ).pack(anchor="w", padx=15, pady=(10, 0))
+
+        # 账号列表
+        list_frame = ttk.LabelFrame(mgmt_frame, text="已配置账号", padding=8)
+        list_frame.pack(fill="both", expand=True, padx=15, pady=10)
+
+        cols = ('alias', 'bot_id', 'status')
+        self.accounts_tree = ttk.Treeview(list_frame, columns=cols, show='headings', height=8)
+        self.accounts_tree.heading('alias', text='账号别名')
+        self.accounts_tree.heading('bot_id', text='Bot ID')
+        self.accounts_tree.heading('status', text='状态')
+        self.accounts_tree.column('alias', width=150, anchor='center')
+        self.accounts_tree.column('bot_id', width=200, anchor='center')
+        self.accounts_tree.column('status', width=80, anchor='center')
+
+        acc_sb = ttk.Scrollbar(list_frame, orient="vertical", command=self.accounts_tree.yview)
+        self.accounts_tree.configure(yscrollcommand=acc_sb.set)
+        self.accounts_tree.pack(side="left", fill="both", expand=True)
+        acc_sb.pack(side="right", fill="y")
+
+        # 操作按钮
+        btn_frame = ttk.Frame(mgmt_frame)
+        btn_frame.pack(fill="x", padx=15, pady=5)
+        ttk.Button(btn_frame, text="删除选中账号", command=self._delete_selected_account).pack(side="right", padx=5)
+
+        # 新增账号表单
+        add_frame = ttk.LabelFrame(mgmt_frame, text="新增账号", padding=10)
+        add_frame.pack(fill="x", padx=15, pady=5)
+
+        row1 = ttk.Frame(add_frame)
+        row1.pack(fill="x", pady=4)
+        ttk.Label(row1, text="账号别名:", width=12).pack(side="left")
+        self.new_alias_var = tk.StringVar()
+        ttk.Entry(row1, textvariable=self.new_alias_var, width=25).pack(side="left", padx=5)
+        ttk.Label(row1, text="（即闲鱼账号名，作为唯一标识）", foreground="#888888").pack(side="left")
+
+        row2 = ttk.Frame(add_frame)
+        row2.pack(fill="x", pady=4)
+        ttk.Label(row2, text="Coze Token:", width=12).pack(side="left")
+        self.new_token_var = tk.StringVar()
+        ttk.Entry(row2, textvariable=self.new_token_var, width=45, show="*").pack(side="left", padx=5)
+
+        row3 = ttk.Frame(add_frame)
+        row3.pack(fill="x", pady=4)
+        ttk.Label(row3, text="Bot ID:", width=12).pack(side="left")
+        self.new_bot_id_var = tk.StringVar()
+        ttk.Entry(row3, textvariable=self.new_bot_id_var, width=30).pack(side="left", padx=5)
+
+        ttk.Button(add_frame, text="添加账号", command=self._add_account).pack(anchor="e", pady=5)
+
+        # 刷新列表
+        self._refresh_accounts_tree()
+
+    def _refresh_accounts_tree(self):
+        """刷新账号列表"""
+        if not hasattr(self, 'accounts_tree'):
+            return
+        self.accounts_tree.delete(*self.accounts_tree.get_children())
+        for alias, tab in self.account_tabs.items():
+            status = "运行中" if tab.is_running else "已停止"
+            accounts = load_accounts()
+            bot_id = next((a.bot_id for a in accounts if a.alias == alias), "")
+            short_bot = bot_id[:20] + "..." if len(bot_id) > 20 else bot_id
+            self.accounts_tree.insert('', 'end', values=(alias, short_bot, status))
+
+    def _add_account(self):
+        """添加新账号"""
+        alias = self.new_alias_var.get().strip()
+        token = self.new_token_var.get().strip()
+        bot_id = self.new_bot_id_var.get().strip()
+
+        if not alias:
+            messagebox.showwarning("警告", "账号别名不能为空")
+            return
+        if not token:
+            messagebox.showwarning("警告", "Coze Token 不能为空")
+            return
+        if not bot_id:
+            messagebox.showwarning("警告", "Bot ID 不能为空")
+            return
+        if alias in self.account_tabs:
+            messagebox.showwarning("警告", f"账号 {alias} 已存在")
+            return
+        if len(self.account_tabs) >= 10:
+            messagebox.showwarning("警告", "最多支持10个账号")
+            return
+
+        # 保存到 accounts.json
+        accounts = load_accounts()
+        accounts.append(AccountConfig(alias=alias, coze_token=token, bot_id=bot_id))
+        save_accounts(accounts)
+
+        # 创建 Tab
+        account = AccountConfig(alias=alias, coze_token=token, bot_id=bot_id)
+        tab = AccountTab(self.accounts_notebook, account, self)
+        self.account_tabs[alias] = tab
+
+        # 清空表单
+        self.new_alias_var.set("")
+        self.new_token_var.set("")
+        self.new_bot_id_var.set("")
+
+        self._refresh_accounts_tree()
+        messagebox.showinfo("成功", f"账号 {alias} 已添加")
+
+    def _delete_selected_account(self):
+        """删除选中的账号"""
+        sel = self.accounts_tree.selection()
+        if not sel:
+            messagebox.showwarning("警告", "请先选择要删除的账号")
+            return
+
+        alias = self.accounts_tree.item(sel[0])['values'][0]
+        tab = self.account_tabs.get(alias)
+
+        if tab and tab.is_running:
+            messagebox.showwarning("警告", f"账号 {alias} 正在运行，请先停止再删除")
+            return
+
+        if not messagebox.askokcancel("确认", f"确定删除账号 {alias}？\n（已有的对话数据不会删除）"):
+            return
+
+        # 从 Notebook 移除 Tab
+        if tab:
+            for tab_id in self.accounts_notebook.tabs():
+                if self.accounts_notebook.tab(tab_id, "text") == alias:
+                    self.accounts_notebook.forget(tab_id)
+                    break
+            del self.account_tabs[alias]
+
+        # 从 accounts.json 删除
+        accounts = [a for a in load_accounts() if a.alias != alias]
+        save_accounts(accounts)
+
+        self._refresh_accounts_tree()
+
+    def _load_account_tabs(self):
+        """启动时从 accounts.json 加载账号并创建 Tab"""
+        accounts = load_accounts()
+        for account in accounts:
+            if account.alias not in self.account_tabs:
+                tab = AccountTab(self.accounts_notebook, account, self)
+                self.account_tabs[account.alias] = tab
+        self._refresh_accounts_tree()
 
     # ==================== 概览页 ====================
     def _create_overview_page(self):
@@ -187,7 +563,7 @@ class XianyuGUI:
         # 启动/停止按钮
         self.start_btn = ttk.Button(
             control_frame,
-            text="启动",
+            text="全部启动",
             command=self._toggle_running,
             width=12
         )
@@ -219,15 +595,6 @@ class XianyuGUI:
             width=10
         )
         self.console_btn.pack(side="right", padx=5)
-
-        # 悬浮球显示复选框
-        self.float_ball_visible_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            control_frame,
-            text="悬浮球",
-            variable=self.float_ball_visible_var,
-            command=self._toggle_float_ball_visibility
-        ).pack(side="right", padx=5)
 
         # 运行日志区域
         log_frame = ttk.LabelFrame(page, text="运行日志", padding=10)
@@ -1065,31 +1432,20 @@ AI：已经是最低价了呢，质量绝对有保障。
         page = ttk.Frame(self.content_frame)
         self.pages["system_settings"] = page
 
-        # Coze API 配置
+        # Coze API 配置（已移至账号管理页）
         api_frame = ttk.LabelFrame(page, text="配置设置", padding=15)
         api_frame.pack(fill="x", padx=20, pady=15)
 
-        # API Token
-        row1 = ttk.Frame(api_frame)
-        row1.pack(fill="x", pady=5)
-        ttk.Label(row1, text="Coze API Token:", width=15).pack(side="left")
-        self.api_token_var = tk.StringVar()
-        self.api_token_entry = ttk.Entry(row1, textvariable=self.api_token_var, width=50, show="*")
-        self.api_token_entry.pack(side="left", padx=5)
-        self.api_token_entry.bind("<FocusOut>", lambda e: self._auto_save_config())
-        self.show_token = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row1, text="显示", variable=self.show_token,
-                       command=self._toggle_token_visibility).pack(side="left", padx=5)
+        ttk.Label(
+            api_frame,
+            text="Coze API Token 和 Bot ID 已移至左侧「账号管理」页，每个账号独立配置。",
+            font=("Microsoft YaHei", 9), foreground="#666666"
+        ).pack(anchor="w", pady=5)
 
-        # Bot ID
-        row2 = ttk.Frame(api_frame)
-        row2.pack(fill="x", pady=5)
-        ttk.Label(row2, text="Coze Bot ID:", width=15).pack(side="left")
+        # 保留隐藏的变量，避免其他方法引用报错
+        self.api_token_var = tk.StringVar()
         self.bot_id_var = tk.StringVar()
-        bot_id_entry = ttk.Entry(row2, textvariable=self.bot_id_var, width=50)
-        bot_id_entry.pack(side="left", padx=5)
-        bot_id_entry.bind("<FocusOut>", lambda e: self._auto_save_config())
-        ttk.Button(row2, text="测试连接", command=self._test_coze_connection).pack(side="left", padx=20)
+        self.show_token = tk.BooleanVar(value=False)
 
         # 数据库配置
         db_frame = ttk.LabelFrame(page, text="数据库配置 (对话记忆)", padding=15)
@@ -1211,8 +1567,6 @@ AI：已经是最低价了呢，质量绝对有保障。
     # ==================== 配置相关方法 ====================
     def _load_config(self):
         """加载配置"""
-        self.api_token_var.set(os.getenv("COZE_API_TOKEN", ""))
-        self.bot_id_var.set(os.getenv("COZE_BOT_ID", ""))
         self.interval_var.set(os.getenv("XIANYU_CHECK_INTERVAL", "2"))
         self.skip_duplicate_var.set(os.getenv("SKIP_DUPLICATE_MSG", "true").lower() == "true")
         self.msg_expire_var.set(os.getenv("MSG_EXPIRE_SECONDS", "60"))
@@ -1246,8 +1600,6 @@ AI：已经是最低价了呢，质量绝对有保障。
             if not self.env_path.exists():
                 self.env_path.touch()
 
-            set_key(str(self.env_path), "COZE_API_TOKEN", self.api_token_var.get())
-            set_key(str(self.env_path), "COZE_BOT_ID", self.bot_id_var.get())
             set_key(str(self.env_path), "XIANYU_CHECK_INTERVAL", self.interval_var.get())
             set_key(str(self.env_path), "HEADLESS", "false")
             set_key(str(self.env_path), "SKIP_DUPLICATE_MSG", str(self.skip_duplicate_var.get()).lower())
@@ -1299,11 +1651,8 @@ AI：已经是最低价了呢，质量绝对有保障。
         self.root.after(3000, lambda: self.merge_save_status.set(""))
 
     def _toggle_token_visibility(self):
-        """切换密钥显示/隐藏"""
-        if self.show_token.get():
-            self.api_token_entry.config(show="")
-        else:
-            self.api_token_entry.config(show="*")
+        """切换密钥显示/隐藏（已移除，保留空方法避免引用报错）"""
+        pass
 
     def _on_duplicate_toggle(self):
         """重复消息过滤开关切换"""
@@ -1341,20 +1690,18 @@ AI：已经是最低价了呢，质量绝对有保障。
             self._log(f"数据库连接失败: {e}")
 
     def _test_coze_connection(self):
-        """测试Coze API连接"""
-        api_token = self.api_token_var.get().strip()
-        bot_id = self.bot_id_var.get().strip()
-
-        if not api_token:
-            messagebox.showerror("错误", "请先填写 Coze API Token")
-            return
-        if not bot_id:
-            messagebox.showerror("错误", "请先填写 Coze Bot ID")
+        """测试Coze API连接（使用账号管理中的第一个账号）"""
+        accounts = load_accounts()
+        if not accounts:
+            messagebox.showerror("错误", "请先在「账号管理」页添加账号")
             return
 
-        # 检查 token 格式
-        if api_token.startswith('/') or ':/' in api_token or api_token.endswith('.bat'):
-            messagebox.showerror("错误", "API Token 格式错误！\n\n看起来你填的是文件路径，请填写正确的 Coze API Token。\n\n正确格式示例：pat_xxxxxxxxxxxxxxxx")
+        account = accounts[0]
+        api_token = account.coze_token
+        bot_id = account.bot_id
+
+        if not api_token or not bot_id:
+            messagebox.showerror("错误", f"账号 {account.alias} 配置不完整")
             return
 
         try:
@@ -1363,8 +1710,7 @@ AI：已经是最低价了呢，质量绝对有保障。
                 "Authorization": f"Bearer {api_token}",
                 "Content-Type": "application/json"
             }
-            # 使用 Coze API 获取 bot 信息来测试连接
-            with httpx.Client(timeout=10) as client:
+            with httpx.Client(timeout=10, trust_env=False) as client:
                 response = client.get(
                     f"https://api.coze.cn/v1/bot/get_online_info?bot_id={bot_id}",
                     headers=headers
@@ -1373,8 +1719,8 @@ AI：已经是最低价了呢，质量绝对有保障。
 
                 if result.get("code") == 0:
                     bot_name = result.get("data", {}).get("name", "未知")
-                    messagebox.showinfo("成功", f"Coze API 连接成功！\n\nBot 名称: {bot_name}")
-                    self._log(f"Coze API 连接测试成功，Bot: {bot_name}")
+                    messagebox.showinfo("成功", f"Coze API 连接成功！\n\n账号: {account.alias}\nBot 名称: {bot_name}")
+                    self._log(f"Coze API 连接测试成功，账号: {account.alias}, Bot: {bot_name}")
                 else:
                     error_msg = result.get("msg", "未知错误")
                     messagebox.showerror("错误", f"Coze API 连接失败:\n{error_msg}")
@@ -1891,11 +2237,27 @@ AI：已经是最低价了呢，质量绝对有保障。
             self._log("已关闭详细日志模式")
 
     def _register_conversation_callback(self):
-        """注册对话记录回调"""
+        """注册对话记录回调，路由到对应账号的 Tab"""
         def on_conversation(msg_type, username, content, conv_id, order_status, level, timestamp=None):
-            self.root.after(0, lambda: self.add_conversation_record(
-                msg_type, username, content, conv_id, order_status, level, timestamp
-            ))
+            # 找到正在运行的账号 Tab，优先匹配（单账号时直接路由）
+            target_tab = None
+            running_tabs = [t for t in self.account_tabs.values() if t.is_running]
+            if len(running_tabs) == 1:
+                target_tab = running_tabs[0]
+            elif len(running_tabs) > 1:
+                # 多账号运行时，暂时广播到所有运行中的 Tab
+                # 后续可通过 account_id 精确路由
+                for tab in running_tabs:
+                    tab.add_conversation_record(msg_type, username, content, order_status, timestamp)
+                return
+
+            if target_tab:
+                target_tab.add_conversation_record(msg_type, username, content, order_status, timestamp)
+            else:
+                # 没有运行中的 Tab，写到概览页
+                self.root.after(0, lambda: self.add_conversation_record(
+                    msg_type, username, content, conv_id, order_status, level, timestamp
+                ))
 
         set_gui_conversation_callback(on_conversation)
 
@@ -2067,22 +2429,18 @@ AI：已经是最低价了呢，质量绝对有保障。
     # ==================== 启动/停止 ====================
     def _toggle_running(self):
         """切换运行状态"""
-        if self.is_running:
+        any_running = any(tab.is_running for tab in self.account_tabs.values())
+        if any_running:
             self._stop()
         else:
             self._start()
 
     def _validate_required_config(self) -> bool:
-        """验证必要配置是否已填写"""
-        validations = [
-            (self.api_token_var.get(), "请先填写 API Token"),
-            (self.bot_id_var.get(), "请先填写 Bot ID"),
-        ]
-        for value, message in validations:
-            if not value:
-                messagebox.showwarning("警告", message)
-                self._show_page("system_settings")
-                return False
+        """验证必要配置是否已填写（概览页启动按钮用，现在只做提示）"""
+        if not self.account_tabs:
+            messagebox.showwarning("警告", "请先在「账号管理」页添加至少一个账号")
+            self._show_page("accounts")
+            return False
         return True
 
     def _start(self):
@@ -2092,64 +2450,47 @@ AI：已经是最低价了呢，质量绝对有保障。
 
         self._auto_save_config()
 
-        self.is_running = True
-        self.is_paused = False  # 重置暂停状态
-        self.start_btn.config(text="停止")
-        self.status_var.set("运行中...")
-        self.status_label.config(fg="green")
+        self._log("正在启动所有账号...")
 
-        self._log("正在启动...")
+        # 启动所有账号 Tab
+        for tab in self.account_tabs.values():
+            if not tab.is_running:
+                tab._start()
 
-        # 显示悬浮球
-        self._show_float_ball()
-
-        self.thread = threading.Thread(target=self._run_handler, daemon=True)
-        self.thread.start()
+        self._sync_overview_state()
 
     def _run_handler(self):
-        """运行消息处理器"""
-        try:
-            import os
-            if "DISPLAY" not in os.environ:
-                os.environ["DISPLAY"] = ":0"
-            load_dotenv(self.env_path, override=True)
-
-            from message_handler import MessageHandler
-
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-
-            self.handler = MessageHandler()
-            self.loop.run_until_complete(self.handler.start())
-
-        except Exception as e:
-            self._log(f"运行出错: {e}")
-            self.root.after(0, self._on_stopped)
+        """保留兼容，实际由 AccountTab._run_handler 执行"""
+        pass
 
     def _stop(self):
-        """停止程序"""
-        self._log("正在停止...")
-
-        if self.handler:
-            self.handler.running = False
-
-        if self.loop and self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
-
+        """停止所有账号"""
+        self._log("正在停止所有账号...")
+        for tab in self.account_tabs.values():
+            if tab.is_running:
+                tab._stop()
         self._on_stopped()
 
     def _on_stopped(self):
         """停止后处理"""
         self.is_running = False
-        self.is_paused = False  # 重置暂停状态
-        self.start_btn.config(text="启动")
-        self.status_var.set("已停止")
-        self.status_label.config(fg="gray")
+        self.is_paused = False
+        self._sync_overview_state()
+        self._log("所有账号已停止")
 
-        # 隐藏悬浮球
-        self._hide_float_ball()
-
-        self._log("已停止")
+    def _sync_overview_state(self):
+        """根据实际账号运行状态同步概览页按钮和状态标签"""
+        any_running = any(tab.is_running for tab in self.account_tabs.values())
+        if any_running:
+            self.is_running = True
+            self.start_btn.config(text="全部停止")
+            self.status_var.set("运行中...")
+            self.status_label.config(fg="green")
+        else:
+            self.is_running = False
+            self.start_btn.config(text="全部启动")
+            self.status_var.set("已停止")
+            self.status_label.config(fg="gray")
 
     def run(self):
         """运行GUI"""
@@ -2158,299 +2499,14 @@ AI：已经是最低价了呢，质量绝对有保障。
 
     def _on_closing(self):
         """关闭窗口"""
-        if self.is_running:
-            if messagebox.askokcancel("确认", "程序正在运行，确定要退出吗？"):
+        any_running = any(tab.is_running for tab in self.account_tabs.values())
+        if any_running:
+            if messagebox.askokcancel("确认", "有账号正在运行，确定要退出吗？"):
                 self._stop()
-                self._destroy_float_ball()
                 self.root.destroy()
         else:
-            self._destroy_float_ball()
             self.root.destroy()
 
-    # ==================== 悬浮球功能 ====================
-    def _create_float_ball_image(self, icon_type="pause"):
-        """使用 PIL 创建iOS风格3D效果的悬浮球图片
-
-        Args:
-            icon_type: "pause" 暂停图标(两条竖线), "play" 播放图标(三角形)
-        """
-        # 使用4倍大小绘制，然后缩小以获得抗锯齿效果
-        scale = 4
-        size = self._ball_size * scale
-
-        # 透明色（必须和窗口的 transparentcolor 一致）
-        trans_color = (1, 1, 1)  # #010101
-
-        # 创建背景为透明色的图片
-        img = Image.new('RGBA', (size, size), (*trans_color, 255))
-        draw = ImageDraw.Draw(img)
-
-        # 基础黄色
-        base_color = (255, 229, 0)  # #FFE500
-
-        # 绘制圆形背景（底色稍暗，模拟3D效果）
-        darker_color = (230, 200, 0)  # 底部稍暗
-        draw.ellipse([0, 0, size - 1, size - 1], fill=darker_color)
-
-        # 绘制主体渐变效果（从上到下，亮到暗）
-        for i in range(size // 2):
-            # 计算渐变颜色（顶部亮，底部暗）
-            ratio = i / (size // 2)
-            r = int(255 - ratio * 25)
-            g = int(229 - ratio * 29)
-            b = int(0)
-            # 绘制椭圆切片
-            y_top = i
-            y_bottom = size - i
-            if y_top < y_bottom:
-                draw.ellipse([i, y_top, size - i, y_bottom], fill=(r, g, b))
-
-        # 重新绘制主圆（确保边缘清晰）
-        draw.ellipse([2, 2, size - 3, size - 3], fill=base_color)
-
-        # 绘制高光效果（顶部光泽）- iOS风格
-        highlight_height = size // 3
-        highlight_img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
-        highlight_draw = ImageDraw.Draw(highlight_img)
-
-        # 顶部高光椭圆
-        highlight_draw.ellipse(
-            [size // 6, 4, size - size // 6, highlight_height + 20],
-            fill=(255, 255, 255, 80)  # 半透明白色
-        )
-        # 合并高光
-        img = Image.alpha_composite(img, highlight_img)
-        draw = ImageDraw.Draw(img)
-
-        # 绘制底部阴影（轻微）
-        shadow_img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
-        shadow_draw = ImageDraw.Draw(shadow_img)
-        shadow_draw.ellipse(
-            [size // 6, size - highlight_height - 10, size - size // 6, size - 8],
-            fill=(180, 150, 0, 60)  # 半透明深黄
-        )
-        img = Image.alpha_composite(img, shadow_img)
-        draw = ImageDraw.Draw(img)
-
-        cx, cy = size // 2, size // 2
-        icon_color = (61, 61, 61)  # #3D3D3D 深灰色图标
-
-        if icon_type == "pause":
-            # 绘制暂停图标（两条圆角竖线）
-            bar_width = 18
-            bar_height = 70
-            gap = 14
-            radius = 6
-
-            # 左边竖线
-            x1, y1 = cx - gap - bar_width, cy - bar_height // 2
-            x2, y2 = cx - gap, cy + bar_height // 2
-            draw.rounded_rectangle([x1, y1, x2, y2], radius=radius, fill=icon_color)
-
-            # 右边竖线
-            x1, y1 = cx + gap, cy - bar_height // 2
-            x2, y2 = cx + gap + bar_width, cy + bar_height // 2
-            draw.rounded_rectangle([x1, y1, x2, y2], radius=radius, fill=icon_color)
-
-        elif icon_type == "play":
-            # 绘制播放图标（三角形）
-            triangle_size = 36
-            offset_x = 8
-            points = [
-                (cx - triangle_size + offset_x, cy - triangle_size - 4),
-                (cx - triangle_size + offset_x, cy + triangle_size + 4),
-                (cx + triangle_size + offset_x, cy),
-            ]
-            draw.polygon(points, fill=icon_color)
-
-        # 缩小到目标大小（高质量抗锯齿）
-        img = img.resize((self._ball_size, self._ball_size), Image.Resampling.LANCZOS)
-
-        # 清理边缘
-        pixels = img.load()
-        for y in range(self._ball_size):
-            for x in range(self._ball_size):
-                r, g, b, a = pixels[x, y]
-                if r < 50 and g < 50 and b < 50 and not (55 <= r <= 65 and 55 <= g <= 65 and 55 <= b <= 65):
-                    pixels[x, y] = (1, 1, 1, 255)
-
-        return ImageTk.PhotoImage(img)
-
-    def _create_float_ball(self):
-        """创建悬浮球窗口"""
-        if self.float_ball is not None:
-            return
-
-        # 尺寸定义
-        self._ball_size = 56
-
-        self.float_ball = tk.Toplevel(self.root)
-        self.float_ball.title("")
-        self.float_ball.overrideredirect(True)  # 无边框
-        self.float_ball.attributes("-topmost", True)  # 始终置顶
-
-        # 获取屏幕尺寸，放在右下角
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        x = screen_width - self._ball_size - 50
-        y = screen_height - self._ball_size - 100
-
-        self.float_ball.geometry(f"{self._ball_size}x{self._ball_size}+{x}+{y}")
-
-        # 设置窗口背景
-        transparent_color = "#010101"
-        self.float_ball.config(bg=transparent_color)
-        try:
-            self.float_ball.attributes("-transparentcolor", transparent_color)
-        except Exception:
-            # Linux 不支持 -transparentcolor，使用 -alpha 替代
-            self.float_ball.attributes("-alpha", 0.8)
-
-        # 创建画布
-        self.float_ball_canvas = tk.Canvas(
-            self.float_ball,
-            width=self._ball_size,
-            height=self._ball_size,
-            highlightthickness=0,
-            bg=transparent_color
-        )
-        self.float_ball_canvas.pack(fill="both", expand=True)
-
-        # 预先创建两种状态的图片（保持引用防止被垃圾回收）
-        # 运行中：亮黄色 + 暂停图标（点击可暂停）
-        self._running_image = self._create_float_ball_image(icon_type="pause")
-        # 已暂停：亮黄色 + 播放图标（点击可恢复）
-        self._paused_image = self._create_float_ball_image(icon_type="play")
-
-        # 在画布上显示图片
-        self._ball_image_id = self.float_ball_canvas.create_image(
-            self._ball_size // 2, self._ball_size // 2,
-            image=self._running_image
-        )
-
-        # 绑定拖拽事件
-        self.float_ball_canvas.bind("<Button-1>", self._on_float_ball_click)
-        self.float_ball_canvas.bind("<B1-Motion>", self._on_float_ball_drag)
-        self.float_ball_canvas.bind("<ButtonRelease-1>", self._on_float_ball_release)
-        self.float_ball_canvas.bind("<Button-3>", self._on_float_ball_right_click)  # 右键菜单
-
-        # 创建右键菜单
-        self._float_ball_menu = tk.Menu(self.float_ball, tearoff=0)
-        self._float_ball_menu.add_command(label="隐藏悬浮球", command=self._hide_float_ball_by_user)
-
-        # 拖拽状态
-        self._drag_data = {"x": 0, "y": 0, "dragging": False}
-
-        # 更新悬浮球状态
-        self._update_float_ball_status()
-
-    def _on_float_ball_click(self, event):
-        """悬浮球点击开始"""
-        self._drag_data["x"] = event.x
-        self._drag_data["y"] = event.y
-        self._drag_data["dragging"] = False
-        self._drag_data["start_x"] = event.x
-        self._drag_data["start_y"] = event.y
-
-    def _on_float_ball_drag(self, event):
-        """悬浮球拖拽"""
-        # 计算移动距离，判断是否是拖拽
-        dx = abs(event.x - self._drag_data.get("start_x", event.x))
-        dy = abs(event.y - self._drag_data.get("start_y", event.y))
-        if dx > 5 or dy > 5:
-            self._drag_data["dragging"] = True
-
-        if self._drag_data["dragging"]:
-            x = self.float_ball.winfo_x() + (event.x - self._drag_data["x"])
-            y = self.float_ball.winfo_y() + (event.y - self._drag_data["y"])
-            self.float_ball.geometry(f"+{x}+{y}")
-
-    def _on_float_ball_release(self, event):
-        """悬浮球点击释放"""
-        # 如果不是拖拽，则切换暂停状态
-        if not self._drag_data.get("dragging", False):
-            self._toggle_pause()
-        self._drag_data["dragging"] = False
-
-    def _on_float_ball_right_click(self, event):
-        """悬浮球右键点击 - 显示菜单"""
-        try:
-            self._float_ball_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self._float_ball_menu.grab_release()
-
-    def _hide_float_ball_by_user(self):
-        """用户主动隐藏悬浮球"""
-        self._hide_float_ball()
-        self.float_ball_visible_var.set(False)
-        self._log("悬浮球已隐藏，可在概览页重新显示")
-
-    def _toggle_float_ball_visibility(self):
-        """切换悬浮球显示/隐藏（由复选框控制）"""
-        if self.float_ball_visible_var.get():
-            if self.is_running:
-                self._show_float_ball()
-        else:
-            self._hide_float_ball()
-
-    def _toggle_pause(self):
-        """切换暂停/恢复状态"""
-        self.is_paused = not self.is_paused
-
-        # 同步到 handler
-        if self.handler:
-            self.handler.is_paused = self.is_paused
-
-        # 更新悬浮球状态
-        self._update_float_ball_status()
-
-        # 更新主界面状态
-        if self.is_paused:
-            self.status_var.set("已暂停")
-            self.status_label.config(fg="orange")
-            self._log("已暂停 - 新消息将进入等待队列")
-        else:
-            self.status_var.set("运行中...")
-            self.status_label.config(fg="green")
-            self._log("已恢复 - 继续处理消息")
-
-    def _update_float_ball_status(self):
-        """更新悬浮球显示状态"""
-        if self.float_ball is None or not self.float_ball.winfo_exists():
-            return
-
-        if self.is_paused:
-            # 暂停状态 - 灰色背景 + 暂停图标
-            self.float_ball_canvas.itemconfig(self._ball_image_id, image=self._paused_image)
-        else:
-            # 运行状态 - 闲鱼黄色 + "闲鱼"文字
-            self.float_ball_canvas.itemconfig(self._ball_image_id, image=self._running_image)
-
-    def _show_float_ball(self):
-        """显示悬浮球"""
-        # 检查用户是否设置了隐藏悬浮球
-        if hasattr(self, 'float_ball_visible_var') and not self.float_ball_visible_var.get():
-            return
-
-        if self.float_ball is None:
-            self._create_float_ball()
-        else:
-            self.float_ball.deiconify()
-        self._update_float_ball_status()
-
-    def _hide_float_ball(self):
-        """隐藏悬浮球"""
-        if self.float_ball is not None and self.float_ball.winfo_exists():
-            self.float_ball.withdraw()
-
-    def _destroy_float_ball(self):
-        """销毁悬浮球"""
-        if self.float_ball is not None:
-            try:
-                self.float_ball.destroy()
-            except:
-                pass
-            self.float_ball = None
 
 
 if __name__ == "__main__":

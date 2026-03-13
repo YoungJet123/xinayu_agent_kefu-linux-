@@ -8,9 +8,9 @@ from config import Config
 class CozeClient:
     """Coze 智能体 API 客户端"""
 
-    def __init__(self):
-        self.api_token = Config.COZE_API_TOKEN
-        self.bot_id = Config.COZE_BOT_ID
+    def __init__(self, token: str = None, bot_id: str = None):
+        self.api_token = token or ""
+        self.bot_id = bot_id or ""
         self.base_url = Config.COZE_API_BASE
         self.headers = {
             "Authorization": f"Bearer {self.api_token}",

@@ -6,11 +6,11 @@ import time
 from xianyu_browser import XianyuBrowser
 from coze_client import CozeClient
 from logger_setup import log_conversation, log_system_message
-from config import Config, CozeVars
-from db_manager import db_manager
+from config import Config, CozeVars, AccountConfig
+from db_manager import DBManager, db_manager
 
 
-async def build_memory_context(coze_client: CozeClient, user_id: str, current_item_id: str, current_message: str) -> Optional[dict]:
+async def build_memory_context(coze_client: CozeClient, db: 'DBManager', user_id: str, current_item_id: str, current_message: str) -> Optional[dict]:
     """
     为回头客构建新会话回忆上下文
 
@@ -44,7 +44,7 @@ async def build_memory_context(coze_client: CozeClient, user_id: str, current_it
         return None
 
     # 获取用户的其他会话（有conversation_id的）
-    other_sessions = db_manager.get_user_other_sessions(user_id, current_item_id)
+    other_sessions = db.get_user_other_sessions(user_id, current_item_id)
     if not other_sessions:
         logger.debug(f"[新会话回忆] 用户 {user_id} 没有其他会话")
         return None
@@ -110,9 +110,17 @@ async def build_memory_context(coze_client: CozeClient, user_id: str, current_it
 class MessageHandler:
     """消息处理器"""
 
-    def __init__(self):
-        self.browser = XianyuBrowser()
-        self.coze_client = CozeClient()
+    def __init__(self, account: AccountConfig = None):
+        self.account = account
+        self.browser = XianyuBrowser(
+            user_data_dir=account.user_data_dir if account else None
+        )
+        self.coze_client = CozeClient(
+            token=account.coze_token if account else None,
+            bot_id=account.bot_id if account else None,
+        )
+        # 每个账号独立的 db_manager 实例
+        self.db = DBManager(account_id=account.account_id if account else "default")
         # 已处理的消息标识 -> 处理时间戳 (用于过期检测)
         self.processed_messages: Dict[str, float] = {}
         # 从配置读取重复消息过滤设置
@@ -167,8 +175,8 @@ class MessageHandler:
             logger.info("消息合并: 已关闭")
 
         # 连接数据库
-        if db_manager.connect():
-            db_manager.init_tables()
+        if self.db.connect():
+            self.db.init_tables()
             logger.info("数据库连接成功，对话记忆功能已启用")
         else:
             logger.warning("数据库连接失败，将不保存对话历史")
@@ -197,7 +205,7 @@ class MessageHandler:
         """停止消息处理器"""
         self.running = False
         await self.browser.close()
-        db_manager.close()
+        self.db.close()
         logger.info("消息处理器已停止")
 
     async def _message_loop(self):
@@ -417,13 +425,13 @@ class MessageHandler:
 
             # 保存对话记录
             if new_conv_id:
-                db_manager.update_conversation_id(buyer_name, new_conv_id)
-                db_manager.update_session_conversation_id(user_id, item_id, new_conv_id)
-            db_manager.add_message(buyer_name, "user", merged_message, new_conv_id)
-            db_manager.add_message(buyer_name, "assistant", reply, new_conv_id)
+                self.db.update_conversation_id(buyer_name, new_conv_id)
+                self.db.update_session_conversation_id(user_id, item_id, new_conv_id)
+            self.db.add_message(buyer_name, "user", merged_message, new_conv_id)
+            self.db.add_message(buyer_name, "assistant", reply, new_conv_id)
 
             # 更新会话的最后消息时间
-            db_manager.update_session_message_time(user_id, item_id)
+            self.db.update_session_message_time(user_id, item_id)
 
             # 标记消息为已处理
             if self.skip_duplicate_msg:
@@ -481,12 +489,12 @@ class MessageHandler:
                 del self._inactive_timers[user_id]
 
             # 检查是否已发送过 inactive
-            if db_manager.is_inactive_sent(user_id):
+            if self.db.is_inactive_sent(user_id):
                 logger.debug(f"[Inactive] 用户 {user_id} 已发送过 inactive，跳过")
                 return
 
             # 检查订单状态（排除已付款用户）
-            sessions = db_manager.get_user_sessions(user_id)
+            sessions = self.db.get_user_sessions(user_id)
             for session in sessions:
                 order_status = session.get('order_status', '')
                 if order_status in ['paid', '已付款', '待发货', '已发货', '交易成功']:
@@ -524,7 +532,7 @@ class MessageHandler:
                 await self._send_inactive_message_to_user(user_id, buyer_name, reply, conversation_id)
 
             # 标记该用户已发送过 inactive
-            db_manager.set_inactive_sent(user_id, True)
+            self.db.set_inactive_sent(user_id, True)
 
         except asyncio.CancelledError:
             # 定时器被取消（用户有新消息了）
@@ -597,7 +605,7 @@ class MessageHandler:
                 buyer_id=buyer_name,
                 message=message,
             )
-            db_manager.update_session_buyer_name(user_id, buyer_name)
+            self.db.update_session_buyer_name(user_id, buyer_name)
         else:
             logger.error(f"[Inactive] 发送消息失败: {buyer_name}")
 
@@ -642,7 +650,7 @@ class MessageHandler:
 
         # 从数据库获取商品信息并组装格式化字符串
         if item_id and item_id != "unknown":
-            db_product = db_manager.get_product(item_id)
+            db_product = self.db.get_product(item_id)
             if db_product:
                 # 组装格式化的商品信息
                 formatted_info = "[当前会话-商品信息]\n"
@@ -712,7 +720,7 @@ class MessageHandler:
 
         # ===== 新的会话管理系统 =====
         # 使用 user_id + item_id 来管理会话
-        session = db_manager.get_or_create_session(
+        session = self.db.get_or_create_session(
             user_id=user_id,
             item_id=item_id,
             buyer_name=buyer_name,
@@ -725,7 +733,7 @@ class MessageHandler:
             logger.info(f"[会话] 用户类型: {customer_type}, conversation_id: {conversation_id}")
 
             # 用户发了新消息，重置 inactive 状态并取消定时器
-            db_manager.reset_user_inactive_status(user_id)
+            self.db.reset_user_inactive_status(user_id)
             self._cancel_inactive_timer(user_id)
         else:
             conversation_id = None
@@ -738,14 +746,14 @@ class MessageHandler:
             logger.info(f"[会话] 为用户 {buyer_name} 创建新的 Coze 会话...")
             conversation_id = await self.coze_client.create_conversation(buyer_name)
             if conversation_id:
-                db_manager.update_session_conversation_id(user_id, item_id, conversation_id)
+                self.db.update_session_conversation_id(user_id, item_id, conversation_id)
                 logger.info(f"[会话] 新会话已创建: {conversation_id}")
 
             # 如果是回头客的新会话，获取历史上下文
             if customer_type == 'returning' and Config.MEMORY_ENABLED:
                 logger.info(f"[新会话回忆] 检测到回头客，准备获取历史上下文")
                 memory_result = await build_memory_context(
-                    self.coze_client, user_id, item_id, full_message
+                    self.coze_client, self.db, user_id, item_id, full_message
                 )
                 if memory_result:
                     # 保存前缀（用于消息合并时拼接）和完整消息
@@ -757,7 +765,7 @@ class MessageHandler:
         custom_vars['customer_type'] = customer_type
 
         # 同时保持旧的 users 表兼容
-        db_manager.update_conversation_id(buyer_name, conversation_id)
+        self.db.update_conversation_id(buyer_name, conversation_id)
 
         return {
             'buyer_name': buyer_name,
@@ -870,13 +878,13 @@ class MessageHandler:
 
             # 保存对话记录（同时更新新旧两套系统）
             if new_conv_id:
-                db_manager.update_conversation_id(buyer_name, new_conv_id)
-                db_manager.update_session_conversation_id(user_id, item_id, new_conv_id)
-            db_manager.add_message(buyer_name, "user", full_message, new_conv_id)
-            db_manager.add_message(buyer_name, "assistant", reply, new_conv_id)
+                self.db.update_conversation_id(buyer_name, new_conv_id)
+                self.db.update_session_conversation_id(user_id, item_id, new_conv_id)
+            self.db.add_message(buyer_name, "user", full_message, new_conv_id)
+            self.db.add_message(buyer_name, "assistant", reply, new_conv_id)
 
             # 更新会话的最后消息时间
-            db_manager.update_session_message_time(user_id, item_id)
+            self.db.update_session_message_time(user_id, item_id)
 
             # 标记消息为已处理
             if self.skip_duplicate_msg:
@@ -955,13 +963,13 @@ class ManualMessageHandler(MessageHandler):
 
             # 保存对话记录（同时更新新旧两套系统）
             if new_conv_id:
-                db_manager.update_conversation_id(buyer_name, new_conv_id)
-                db_manager.update_session_conversation_id(user_id, item_id, new_conv_id)
-            db_manager.add_message(buyer_name, "user", full_message, new_conv_id)
-            db_manager.add_message(buyer_name, "assistant", final_reply, new_conv_id)
+                self.db.update_conversation_id(buyer_name, new_conv_id)
+                self.db.update_session_conversation_id(user_id, item_id, new_conv_id)
+            self.db.add_message(buyer_name, "user", full_message, new_conv_id)
+            self.db.add_message(buyer_name, "assistant", final_reply, new_conv_id)
 
             # 更新会话的最后消息时间
-            db_manager.update_session_message_time(user_id, item_id)
+            self.db.update_session_message_time(user_id, item_id)
 
             # 发送回复
             if await self.browser.send_message(final_reply):
